@@ -36,7 +36,18 @@ def print_dim(msg):
     console.print(f"[dim]  {msg}[/dim]")
 
 
+_progress_factory = None
+
+
+def set_progress_factory(factory):
+    """Override the progress object factory (used by the GUI)."""
+    global _progress_factory
+    _progress_factory = factory
+
+
 def make_progress():
+    if _progress_factory is not None:
+        return _progress_factory()
     return Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]{task.description}"),

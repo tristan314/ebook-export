@@ -7,7 +7,6 @@ import shutil
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin
 
-import fitz
 import requests
 
 from login_form import LoginFormParser
@@ -263,22 +262,25 @@ def export_book(book, auth, cfg):
 
     progress = make_progress()
     with progress:
-        # Phase 1: Download
-        dl_task = progress.add_task("[cyan]Downloading pages", total=len(download_tasks))
+        # Create both bars upfront (total = page count, not file count)
+        dl_task = progress.add_task("[cyan]Downloading pages", total=total)
+        pdf_task = progress.add_task("[cyan]Building PDF", total=total)
+
+        # Phase 1: Download (2 files per page → advance 0.5 per file)
         failed = asyncio.run(download_pages(
             download_tasks,
             session_headers=session_headers,
             max_concurrent=max_concurrent,
             progress=progress,
             progress_task=dl_task,
+            progress_scale=0.5,
         ))
         if failed:
-            progress.update(dl_task, description=f"[yellow]Downloaded ({len(failed)} failed)")
+            progress.update(dl_task, completed=total, description=f"[yellow]Downloaded ({len(failed) // 2} pages failed)")
         else:
-            progress.update(dl_task, description="[green]Download complete")
+            progress.update(dl_task, completed=total, description="[green]Download complete")
 
         # Phase 2: Build PDF
-        pdf_task = progress.add_task("[cyan]Building PDF", total=total)
         pages_data = _prepare_pages_data(pages_dir, data, total, scale)
         build_pdf(pages_data, output_file, progress=progress, progress_task=pdf_task)
         progress.update(pdf_task, description="[green]PDF complete")
@@ -291,7 +293,11 @@ def export_book(book, auth, cfg):
 
 
 def _prepare_pages_data(pages_dir, data, total, scale):
-    """Convert Klett page data into the format expected by pdf_builder."""
+    """Convert Klett page data into the format expected by pdf_builder.
+
+    Does NOT open image files — stores reference coordinates so that
+    build_pdf can scale them after opening each image once.
+    """
     pages_data = []
 
     for i in range(total):
@@ -301,48 +307,22 @@ def _prepare_pages_data(pages_dir, data, total, scale):
 
         page_data = {"image_path": img_path, "text_boxes": None, "links": None}
 
-        # Parse SVG word boxes + text from data.json
+        # Parse SVG word boxes + text from data.json (unscaled)
         page_info = data["pages"][i]
         text = page_info["content"].get("text", "")
         words = text.split()
 
-        if words and os.path.exists(svg_path) and os.path.exists(img_path):
+        if words and os.path.exists(svg_path):
             boxes = _parse_svg_word_boxes(svg_path)
-            # Need page dimensions to scale SVG coords → PDF coords
-            img = fitz.open(img_path)
-            pdfbytes = img.convert_to_pdf()
-            img.close()
-            img_pdf = fitz.open("pdf", pdfbytes)
-            pw = img_pdf[0].rect.width
-            ph = img_pdf[0].rect.height
-            img_pdf.close()
-
-            scale_x = pw / SVG_WIDTH
-            scale_y = ph / SVG_HEIGHT
-
             text_boxes = []
             for word, (bx, by, bw, bh) in zip(words, boxes):
-                text_boxes.append({
-                    "x": bx * scale_x,
-                    "y": by * scale_y,
-                    "w": bw * scale_x,
-                    "h": bh * scale_y,
-                    "text": word,
-                })
-            page_data["text_boxes"] = text_boxes
+                text_boxes.append({"x": bx, "y": by, "w": bw, "h": bh, "text": word})
+            if text_boxes:
+                page_data["text_boxes"] = text_boxes
+                page_data["text_ref_size"] = (SVG_WIDTH, SVG_HEIGHT)
 
-        # Internal page links from layer0
-        if "layers" in page_info and os.path.exists(img_path):
-            # Get page dimensions if not already
-            if not page_data["text_boxes"]:
-                img = fitz.open(img_path)
-                pdfbytes = img.convert_to_pdf()
-                img.close()
-                img_pdf = fitz.open("pdf", pdfbytes)
-                pw = img_pdf[0].rect.width
-                ph = img_pdf[0].rect.height
-                img_pdf.close()
-
+        # Internal page links from layer0 (fractional coordinates)
+        if "layers" in page_info:
             links = []
             for layer in page_info["layers"]:
                 if layer["layer"] != "layer0":
@@ -355,11 +335,12 @@ def _prepare_pages_data(pages_dir, data, total, scale):
                     target_page = int(m.group(1)) - 1
                     if target_page < 0 or target_page >= total:
                         continue
-                    x = area["x"] * pw
-                    y = area["y"] * ph
-                    w = area["width"] * pw
-                    h = area["height"] * ph
-                    links.append({"rect": fitz.Rect(x, y, x + w, y + h), "target_page": target_page})
+                    links.append({
+                        "from_frac": (area["x"], area["y"],
+                                      area["x"] + area["width"],
+                                      area["y"] + area["height"]),
+                        "target_page": target_page,
+                    })
             if links:
                 page_data["links"] = links
 

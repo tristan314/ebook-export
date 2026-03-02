@@ -9,10 +9,16 @@ def build_pdf(pages_data, output_path, progress=None, progress_task=None):
     Args:
         pages_data: list of dicts, each with:
             - image_path: str — path to page image file
-            - text_boxes: list of {x, y, w, h, text} dicts (PDF coordinates)
+            - text_boxes: list of {x, y, w, h, text} dicts
                           OR None to skip text layer
-            - links: list of {rect: fitz.Rect, target_page: int} dicts
-                     OR None to skip links
+            - text_ref_size: (ref_w, ref_h) tuple — if present, text_boxes
+                             coordinates are in this reference space and will
+                             be scaled to actual page dimensions
+            - links: list of link dicts, OR None to skip links.
+                     Each link is either:
+                       {rect: fitz.Rect, target_page: int}  (absolute coords)
+                     or:
+                       {from_frac: (x0, y0, x1, y1), target_page: int}  (0-1 fractions)
         output_path: str — output PDF file path
         progress: Rich Progress instance (optional)
         progress_task: Rich task ID (optional)
@@ -39,12 +45,25 @@ def build_pdf(pages_data, output_path, progress=None, progress_task=None):
         pdfbytes = img.convert_to_pdf()
         img.close()
         img_pdf = fitz.open("pdf", pdfbytes)
-        page = doc.new_page(width=img_pdf[0].rect.width, height=img_pdf[0].rect.height)
+        pw = img_pdf[0].rect.width
+        ph = img_pdf[0].rect.height
+        page = doc.new_page(width=pw, height=ph)
         page.show_pdf_page(page.rect, img_pdf, 0)
         img_pdf.close()
 
-        # Invisible text overlay
+        # Scale text boxes if reference size provided
         text_boxes = page_data.get("text_boxes")
+        ref_size = page_data.get("text_ref_size")
+        if text_boxes and ref_size:
+            sx = pw / ref_size[0]
+            sy = ph / ref_size[1]
+            text_boxes = [
+                {"x": b["x"] * sx, "y": b["y"] * sy,
+                 "w": b["w"] * sx, "h": b["h"] * sy, "text": b["text"]}
+                for b in text_boxes
+            ]
+
+        # Invisible text overlay
         if text_boxes:
             tw = fitz.TextWriter(page.rect)
             for box in text_boxes:
@@ -62,7 +81,12 @@ def build_pdf(pages_data, output_path, progress=None, progress_task=None):
         links = page_data.get("links")
         if links:
             for link in links:
-                pending_links.append((page_idx, link["rect"], link["target_page"]))
+                if "rect" in link:
+                    pending_links.append((page_idx, link["rect"], link["target_page"]))
+                elif "from_frac" in link:
+                    x0, y0, x1, y1 = link["from_frac"]
+                    rect = fitz.Rect(x0 * pw, y0 * ph, x1 * pw, y1 * ph)
+                    pending_links.append((page_idx, rect, link["target_page"]))
 
         if progress and progress_task is not None:
             progress.update(progress_task, advance=1)

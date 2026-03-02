@@ -23,7 +23,7 @@ async def download_file(session, sem, url, out_path, headers=None):
             return False
 
 
-async def download_pages(tasks, session_headers=None, max_concurrent=10, progress=None, progress_task=None):
+async def download_pages(tasks, session_headers=None, max_concurrent=10, progress=None, progress_task=None, progress_scale=1):
     """Download multiple files concurrently.
 
     Args:
@@ -32,6 +32,7 @@ async def download_pages(tasks, session_headers=None, max_concurrent=10, progres
         max_concurrent: semaphore limit
         progress: Rich Progress instance (optional)
         progress_task: Rich task ID for progress updates (optional)
+        progress_scale: amount to advance per file (e.g. 0.5 when 2 files = 1 page)
 
     Returns:
         list of indices that failed
@@ -44,7 +45,7 @@ async def download_pages(tasks, session_headers=None, max_concurrent=10, progres
         if not ok:
             failed.append(idx)
         if progress and progress_task is not None:
-            progress.update(progress_task, advance=1)
+            progress.update(progress_task, advance=progress_scale)
 
     async with aiohttp.ClientSession(headers=session_headers) as session:
         coros = []

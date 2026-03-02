@@ -56,6 +56,7 @@ from tkinter import filedialog
 
 from config import load_config, save_config, get_credentials, store_credentials, CONFIG_PATH
 from platforms import get_platform
+from ui import set_progress_factory
 
 DEFAULT_OUTPUT_DIR = os.path.join(PARENT_DIR, "eBooks")
 
@@ -111,11 +112,13 @@ class GUIProgress:
             }
             return tid
 
-    def update(self, task_id, advance=0, completed=None, description=None, **kwargs):
+    def update(self, task_id, advance=0, completed=None, description=None, total=None, **kwargs):
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
                 return
+            if total is not None:
+                task["total"] = max(total, 1)
             if completed is not None:
                 task["completed"] = completed
             if advance:
@@ -203,16 +206,15 @@ class App(ctk.CTk):
         import ui
         ui.console.file = self.queue_writer
         ui.console._force_terminal = False
-        # Monkey-patch make_progress to return our bridge
+        # Use the factory hook so all callers (even those that imported
+        # make_progress locally) get the GUI bridge.
         self.gui_progress = GUIProgress()
-        self._orig_make_progress = ui.make_progress
-        ui.make_progress = lambda: self.gui_progress
+        set_progress_factory(lambda: self.gui_progress)
 
     def _restore_console(self):
         import ui
         ui.console.file = sys.stderr
-        if hasattr(self, "_orig_make_progress"):
-            ui.make_progress = self._orig_make_progress
+        set_progress_factory(None)
 
     # ── Screen 1: Platform Selection ─────────────────────────────────────
 

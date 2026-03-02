@@ -222,7 +222,10 @@ def book_labels(books):
 # ── Export ───────────────────────────────────────────────────────────────────
 
 def export_book(book, auth, cfg):
-    """Export a Cornelsen eBook — tries lossless first, falls back to tiles."""
+    """Export a Cornelsen eBook — tries lossless first, falls back to tiles.
+
+    Uses a single progress bar throughout the entire export.
+    """
     id_token = auth
     product_id = book["id"]
     sales_id = book.get("sales_id")
@@ -234,42 +237,42 @@ def export_book(book, auth, cfg):
     os.makedirs(ebooks_dir, exist_ok=True)
     output_file = os.path.join(ebooks_dir, f"{book_name}.pdf")
 
-    # Try lossless method first
-    if method in ("auto", "lossless"):
-        console.print()
-        console.print("[bold]Trying lossless PDF download...[/bold]")
-        progress = make_progress()
+    progress = make_progress()
+    with progress:
+        task = progress.add_task("[cyan]Exporting", total=100)
 
-        with progress:
-            ll_task = progress.add_task("[cyan]Lossless download", total=100)
-            result = _try_lossless_download(id_token, product_id, progress, ll_task)
+        # Try lossless method first
+        if method in ("auto", "lossless"):
+            console.print()
+            console.print("[bold]Trying lossless PDF download...[/bold]")
+            result = _try_lossless_download(id_token, product_id, progress, task)
             if result is None and sales_id and sales_id != product_id:
-                result = _try_lossless_download(id_token, sales_id, progress, ll_task)
+                result = _try_lossless_download(id_token, sales_id, progress, task)
+
             if result is not None:
-                progress.update(ll_task, completed=100, description="[green]Decrypted")
+                progress.update(task, completed=100, description="[green]Export complete")
+                pdf_bytes, uma_data = result
+                with open(output_file, "wb") as f:
+                    f.write(pdf_bytes)
+                if uma_data:
+                    try:
+                        _add_bookmarks(output_file, uma_data)
+                    except Exception:
+                        pass
+                size_mb = os.path.getsize(output_file) / (1024 * 1024)
+                doc = fitz.open(output_file)
+                total_pages = len(doc)
+                doc.close()
+                show_export_complete(output_file, total_pages, size_mb, extra="lossless")
+                return
 
-        if result is not None:
-            pdf_bytes, uma_data = result
-            with open(output_file, "wb") as f:
-                f.write(pdf_bytes)
-            if uma_data:
-                try:
-                    _add_bookmarks(output_file, uma_data)
-                except Exception:
-                    pass
-            size_mb = os.path.getsize(output_file) / (1024 * 1024)
-            doc = fitz.open(output_file)
-            total_pages = len(doc)
-            doc.close()
-            show_export_complete(output_file, total_pages, size_mb, extra="lossless")
-            return
+            if method == "lossless":
+                raise RuntimeError("Lossless download not available for this book.")
+            console.print("[yellow]  Lossless not available, falling back to tiles...[/yellow]")
 
-        if method == "lossless":
-            raise RuntimeError("Lossless download not available for this book.")
-        console.print("[yellow]  Lossless not available, falling back to image tiles...[/yellow]")
-
-    # Tile method
-    _export_tiles(id_token, product_id, book_title, book_name, output_file, cfg)
+        # Tile method — reuses the same progress bar
+        _export_tiles(id_token, product_id, book_title, book_name, output_file, cfg,
+                      progress, task)
 
 
 def _try_lossless_download(id_token, product_id, progress, task_id):
@@ -376,14 +379,19 @@ def _add_bookmarks(pdf_path, uma_data):
     doc.close()
 
 
-def _export_tiles(id_token, product_id, book_title, book_name, output_file, cfg):
-    """Fallback: download page tiles from PSPDFKit and build PDF."""
+def _export_tiles(id_token, product_id, book_title, book_name, output_file, cfg,
+                   progress=None, existing_task=None):
+    """Fallback: download page tiles from PSPDFKit and build PDF.
+
+    Uses a single progress bar (reused from export_book if provided).
+    """
     quality = cfg.get("quality", 4)
     max_concurrent = cfg.get("max_concurrent_downloads", 10)
     pages_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "_pages_tmp")
 
-    console.print()
-    console.print("[bold]Preparing tile download...[/bold]")
+    task = existing_task
+    if progress and task is not None:
+        progress.update(task, description="[cyan]Preparing tile download...")
 
     # Start product
     viewer_url = _gql(id_token, "startProduct", START_PRODUCT_MUTATION, {"productId": product_id})["startProduct"]
@@ -453,26 +461,30 @@ def _export_tiles(id_token, product_id, book_title, book_name, output_file, cfg)
         download_tasks.append((img_url, os.path.join(page_dir, "page.webp"), img_headers))
         download_tasks.append((text_url, os.path.join(page_dir, "text.json"), text_headers))
 
-    progress = make_progress()
-    with progress:
-        # Phase 1: Download
-        dl_task = progress.add_task("[cyan]Downloading pages", total=len(download_tasks))
-        failed = asyncio.run(download_pages(
-            download_tasks,
-            max_concurrent=max_concurrent,
-            progress=progress,
-            progress_task=dl_task,
-        ))
-        if failed:
-            progress.update(dl_task, description=f"[yellow]Downloaded ({len(failed)} failed)")
-        else:
-            progress.update(dl_task, description="[green]Download complete")
+    # Single bar: download files + build pages
+    total_items = len(download_tasks) + total
+    if progress and task is not None:
+        progress.update(task, completed=0, total=total_items, description="[cyan]Downloading pages")
+    elif progress:
+        task = progress.add_task("[cyan]Downloading pages", total=total_items)
 
-        # Phase 2: Build PDF
-        pdf_task = progress.add_task("[cyan]Building PDF", total=total)
-        pages_data = _prepare_tile_pages_data(pages_dir, pages, quality)
-        build_pdf(pages_data, output_file, progress=progress, progress_task=pdf_task)
-        progress.update(pdf_task, description="[green]PDF complete")
+    failed = asyncio.run(download_pages(
+        download_tasks,
+        max_concurrent=max_concurrent,
+        progress=progress,
+        progress_task=task,
+    ))
+    if progress and task is not None:
+        if failed:
+            progress.update(task, description=f"[cyan]Building PDF ({len(failed)} failures)")
+        else:
+            progress.update(task, description="[cyan]Building PDF")
+
+    pages_data = _prepare_tile_pages_data(pages_dir, pages, quality)
+    build_pdf(pages_data, output_file, progress=progress, progress_task=task)
+
+    if progress and task is not None:
+        progress.update(task, description="[green]Export complete")
 
     shutil.rmtree(pages_dir, ignore_errors=True)
 
@@ -573,7 +585,11 @@ def _fetch_document_info(pspdfkit_auth, pspdfkit_version=None):
 
 
 def _prepare_tile_pages_data(pages_dir, pages, quality):
-    """Convert Cornelsen tile data into the format expected by pdf_builder."""
+    """Convert Cornelsen tile data into the format expected by pdf_builder.
+
+    Does NOT open image files — stores native coordinates so that
+    build_pdf can scale them after opening each image once.
+    """
     pages_data = []
 
     for i, page_info in enumerate(pages):
@@ -583,25 +599,13 @@ def _prepare_tile_pages_data(pages_dir, pages, quality):
 
         page_data = {"image_path": img_path, "text_boxes": None, "links": None}
 
-        if os.path.exists(text_path) and os.path.exists(img_path):
+        if os.path.exists(text_path):
             try:
                 with open(text_path) as f:
                     text_data = json.load(f)
 
                 native_w = page_info["width"]
                 native_h = page_info["height"]
-
-                # Get actual PDF page dimensions
-                img = fitz.open(img_path)
-                pdfbytes = img.convert_to_pdf()
-                img.close()
-                img_pdf = fitz.open("pdf", pdfbytes)
-                pw = img_pdf[0].rect.width
-                ph = img_pdf[0].rect.height
-                img_pdf.close()
-
-                scale_x = pw / native_w
-                scale_y = ph / native_h
 
                 text_boxes = []
                 for line in text_data.get("textLines", []):
@@ -610,17 +614,18 @@ def _prepare_tile_pages_data(pages_dir, pages, quality):
                         continue
                     bbox = line.get("boundingBox", {})
                     if isinstance(bbox, list):
-                        x = bbox[0] * scale_x
-                        y = bbox[1] * scale_y
-                        h = (bbox[3] - bbox[1]) * scale_y
+                        x = bbox[0]
+                        y = bbox[1]
+                        h = bbox[3] - bbox[1]
                     else:
-                        x = bbox.get("left", 0) * scale_x
-                        y = bbox.get("top", 0) * scale_y
-                        h = bbox.get("height", 12) * scale_y
+                        x = bbox.get("left", 0)
+                        y = bbox.get("top", 0)
+                        h = bbox.get("height", 12)
                     text_boxes.append({"x": x, "y": y, "w": 0, "h": h, "text": text})
 
                 if text_boxes:
                     page_data["text_boxes"] = text_boxes
+                    page_data["text_ref_size"] = (native_w, native_h)
             except Exception:
                 pass
 
